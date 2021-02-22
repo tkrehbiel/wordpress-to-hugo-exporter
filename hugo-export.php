@@ -27,6 +27,8 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 class Hugo_Export
 {
     protected $_tempDir = null;
+    protected $_exportYear = 0; // 0 means all years
+    protected $_exportBlog = -1; // -1 means current one
     private $zip_folder = 'hugo-export/'; //folder zip file extracts to
     private $post_folder = 'posts/'; //folder to place posts within
 
@@ -36,7 +38,15 @@ class Hugo_Export
      *
      * @var bool
      */
-    private $include_comments = false; //export comments as part of the posts they're associated with
+    private $include_comments = true; //export comments as part of the posts they're associated with
+
+    /**
+     * If TRUE, include the wp-content uploads directory.
+     * If FALSE, no images will be included in the archive.
+     * 
+     * @var bool
+     */
+    private $include_images = false; //include image directory
 
     public $rename_options = array('site', 'blog'); //strings to strip from option keys on export
 
@@ -125,6 +135,8 @@ class Hugo_Export
             'author' => get_userdata($post->post_author)->display_name,
             'type' => get_post_type($post),
             'date' => $this->_getPostDateAsIso($post),
+            'slug' => $post->post_name,
+            'comment_count' => $post->comment_count
         );
         if (false === empty($post->post_excerpt)) {
             $output['excerpt'] = $post->post_excerpt;
@@ -216,6 +228,19 @@ class Hugo_Export
     }
 
     /**
+     * Overly simple fix for apostrophe codes.
+     */
+    function fix_apostrophes($s)
+    {
+        $s = str_replace("&#8211;", "-", $s);
+        $s = str_replace("&#8216;", "'", $s);
+        $s = str_replace("&#8217;", "'", $s);
+        $s = str_replace("&#8220;", '"', $s);
+        $s = str_replace("&#8221;", '"', $s);
+        return $s;
+    }
+
+    /**
      * Convert the main post content to Markdown.
      */
     function convert_content($post)
@@ -223,6 +248,8 @@ class Hugo_Export
         $content = apply_filters('the_content', $post->post_content);
         $converter = new Markdownify\ConverterExtra;
         $markdown = $converter->parseString($content);
+
+        $markdown = $this->fix_apostrophes($markdown);
 
         if (false !== strpos($markdown, '[]: ')) {
             // faulty links; return plain HTML
@@ -234,6 +261,7 @@ class Hugo_Export
 
     /**
      * Loop through and convert all comments for the specified post
+     * Comments returned as front matter metadata.
      */
     function convert_comments($post)
     {
@@ -244,18 +272,26 @@ class Hugo_Export
         );
         $comments = get_comments($args);
         if (empty($comments)) {
-            return '';
+            return array();
         }
+
+        $meta = array( 'comments' => array() );
 
         $converter = new Markdownify\ConverterExtra;
-        $output = "\n\n## Comments";
         foreach ($comments as $comment) {
+            $commentmeta = array(
+                'author' => $comment->comment_author,
+                'url' => $comment->comment_author_url,
+                'date' => get_comment_date("Y-m-d H:i:s O", $comment)
+            );
             $content = apply_filters('comment_text', $comment->comment_content);
-            $output .= "\n\n### Comment by " . $comment->comment_author . " on " . get_comment_date("Y-m-d H:i:s O", $comment) . "\n";
-            $output .= $converter->parseString($content);
+            $markdown = $converter->parseString($content);
+            $markdown = $this->fix_apostrophes($markdown);
+            $commentmeta['text'] = $markdown;
+            $meta['comments'][] = $commentmeta;
         }
 
-        return $output;
+        return $meta;
     }
 
     /**
@@ -267,6 +303,12 @@ class Hugo_Export
 
         foreach ($this->get_posts() as $postID) {
             $post = get_post($postID);
+            if( $this->_exportYear != 0 )
+            {
+                // Filter out all but desired year.
+                $year = intval( substr( $post->post_date, 0, 4 ) );
+                if( $year != $this->_exportYear ) continue;
+            }
             setup_postdata($post);
             $meta = array_merge($this->convert_meta($post), $this->convert_terms($postID));
             // remove falsy values, which just add clutter
@@ -276,14 +318,16 @@ class Hugo_Export
                 }
             }
 
+            if ($this->include_comments) {
+                // Comments merged into front matter.
+                $meta = array_merge($meta, $this->convert_comments($post));
+            }
+
             // Hugo doesn't like word-wrapped permalinks
             $output = Spyc::YAMLDump($meta, false, 0);
 
             $output .= "\n---\n";
             $output .= $this->convert_content($post);
-            if ($this->include_comments) {
-                $output .= $this->convert_comments($post);
-            }
             $this->write($output, $post);
         }
     }
@@ -315,6 +359,12 @@ class Hugo_Export
     {
         global $wp_filesystem;
 
+        // Change current blog for multisite support.
+        $previous_blog_id = get_current_blog_id();
+        if( $this->_exportBlog >= 0 ) {
+            switch_to_blog( $this->_exportBlog );
+        }
+
         define('DOING_JEKYLL_EXPORT', true);
 
         $this->require_classes();
@@ -331,10 +381,18 @@ class Hugo_Export
 
         $this->convert_options();
         $this->convert_posts();
-        $this->convert_uploads();
+        // Images optional. Faster to FTP them.
+        if( $this->include_images ) {
+            $this->convert_uploads();
+        }
         $this->zip();
         $this->send();
         $this->cleanup();
+
+        // Restore blog after multisite work.
+        if( $this->_exportBlog >= 0 ) {
+            restore_current_blog();
+        }
     }
 
     /**
@@ -565,6 +623,16 @@ class Hugo_Export
             $this->_tempDir = get_temp_dir();
         }
         return $this->_tempDir;
+    }
+
+    public function setExportYear($year)
+    {
+        $this->_exportYear = $year;
+    }
+
+    public function setExportBlog($blogid)
+    {
+        $this->_exportBlog = $blogid;
     }
 }
 
